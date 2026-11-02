@@ -116,6 +116,7 @@ def validate_ip(red):
 def crear_estado(interface):
     return {
         "clone": False,
+        "timeout": None,
 
         # ─── LO TUYO (atacante) — se llena acá y NADIE lo pisa ───
         "mi_ip":            get_my_ip(interface),   # tu IP real
@@ -178,31 +179,16 @@ def procesar_pkt(pkt, estado):   # modo INGENUO: escucha al cliente y responde
     if tipo in (1, 3):           # 1=discover, 3=request → el cliente pide
         armar_respuesta(pkt, tipo, estado)
 
-def sniff_netword(args, resultado):
-
-    interface = args.iface
-    duration = args.duration
-
+def start_sniff(estado):
     try:
-        estado = crear_estado(interface)
-        estado["ip_ofrecida"], estado["mascara_ofrecida"] = resultado
-        estado["lease"] = args.lease
-        estado["interface"] = interface
-
-        timeout = duration if duration > 0 else None
-
-        print("[+] Interfaz:", interface)
-        print("[+] IP:", estado["mi_ip"])
-        print("[+] MAC:", estado["mi_mac"])
-
         sniff(
             filter="udp and (port 67 or port 68)",
             prn=lambda pkt: procesar_pkt(
                 pkt, estado
             ),
             store=False,
-            iface=interface,
-            timeout=timeout
+            iface=estado["interface"],
+            timeout=estado["timeout"]
         )
 
     except KeyboardInterrupt:
@@ -219,6 +205,25 @@ def sniff_netword(args, resultado):
 
     except Exception as e:
         print("Error global:", e)
+
+def sniff_netword(args, resultado):
+
+    interface = args.iface
+    duration = args.duration
+
+
+    estado = crear_estado(interface)
+    estado["ip_ofrecida"], estado["mascara_ofrecida"] = resultado
+    estado["lease"] = args.lease
+    estado["interface"] = interface
+
+    estado["timeout"] = duration if duration > 0 else None
+
+    print("[+] Interfaz:", interface)
+    print("[+] IP:", estado["mi_ip"])
+    print("[+] MAC:", estado["mi_mac"])
+
+    start_sniff(estado)
 
 def get_data(pkt, estado):
     # Guardas de capa: si falta Ether/BOOTP/DHCP, no es lo que buscamos → salgo
@@ -291,7 +296,11 @@ def look_offer(pkt, estado):     # modo CLONE (hoy): escucha al SERVER y captura
         return
     get_data(pkt, estado)        
 
-    
+def stop_sniff(estado):
+    if estado["server_mac"]:
+        return True
+    return False
+
 def main():
 
     args = crear_args()
@@ -318,6 +327,7 @@ def main():
                 if args.duration > 0
                 else None
             )
+            estado["timeout"]=timeout
 
             sniff(
                 filter="udp and (port 67 or port 68)",
@@ -325,10 +335,15 @@ def main():
                     pkt, estado
                 ),
                 store=False,
-                iface=interface,
+                iface=estado["interface"],
                 timeout=timeout,
-                started_callback= lambda: send_discover(estado)
+                started_callback= lambda: send_discover(estado),
+                stop_filter= lambda pkt :stop_sniff(estado)
             )
+        
+            if not estado["server_mac"]:
+                print("No se pudo clonar")
+                return
 
         except KeyboardInterrupt:
             print("Cerrando programa...")
@@ -339,7 +354,12 @@ def main():
         except OSError as e:
             print("Error de red:", e)
 
+        else:
+            start_sniff(estado)
+
         return
+
+
 
     sniff_netword(args, resultado)
 

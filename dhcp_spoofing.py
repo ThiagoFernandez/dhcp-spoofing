@@ -139,9 +139,8 @@ def armar_respuesta(pkt, tipo, estado):
     src_mac = estado["server_mac"] if estado["clone"] else estado["mi_mac"]
     id_ip = estado["server_id"] if estado["clone"] else estado["mi_ip"]
 
-
     eth_field = Ether(src= src_mac, dst="ff:ff:ff:ff:ff:ff")
-    ip_field = IP(src=estado["mi_ip"], dst="255.255.255.255")
+    ip_field = IP(src=id_ip, dst="255.255.255.255")
     udp_field = UDP(sport=67, dport=68)
     mac_victima = pkt[Ether].src
     bootp_field = BOOTP(
